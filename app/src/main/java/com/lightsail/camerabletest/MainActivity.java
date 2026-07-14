@@ -27,7 +27,6 @@ import android.widget.ListView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
-import java.util.ArrayDeque;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -61,8 +60,6 @@ public final class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, BluetoothDevice> devices = new LinkedHashMap<>();
     private final ArrayList<String> deviceRows = new ArrayList<>();
-    private final Object ackLock = new Object();
-    private final ArrayDeque<Ack> ackQueue = new ArrayDeque<>();
 
     private BluetoothAdapter adapter;
     private BluetoothLeScanner scanner;
@@ -82,7 +79,6 @@ public final class MainActivity extends Activity {
     private int sessionId;
     private long expectedCrc;
     private long startNs;
-    private Ack activeAck;
     private int notificationCount;
 
     @Override
@@ -249,7 +245,6 @@ public final class MainActivity extends Activity {
             runOnUiThread(() -> {
                 Log.i(TAG, "Connection state: status=" + status + " state=" + newState);
                 if (newState == BluetoothGatt.STATE_DISCONNECTED) {
-                    clearAckQueue();
                     rxCharacteristic = null;
                     if (gatt == currentGatt) {
                         gatt = null;
@@ -356,14 +351,6 @@ public final class MainActivity extends Activity {
             }
         }
 
-        @Override
-        public void onCharacteristicWrite(BluetoothGatt currentGatt,
-                                          BluetoothGattCharacteristic characteristic, int status) {
-            if (!isCurrentGatt(currentGatt) || !RX_UUID.equals(characteristic.getUuid())) {
-                return;
-            }
-            onAckWriteComplete(status);
-        }
     };
 
     private void handleNotification(byte[] frame) {
@@ -469,69 +456,21 @@ public final class MainActivity extends Activity {
         ack[7] = (byte) status;
         putLe32(ack, 8, nextOffset);
         putLe32(ack, 12, crc);
-        synchronized (ackLock) {
-            ackQueue.addLast(new Ack(phase, nextOffset, ack));
-        }
-        Log.i(TAG, "Queue ACK: phase=" + phase + " status=" + status + " offset=" + nextOffset);
-        writeNextAck();
-    }
-
-    @SuppressLint("MissingPermission")
-    private void writeNextAck() {
-        Ack next;
-        BluetoothGatt currentGatt;
-        BluetoothGattCharacteristic currentRx;
-        synchronized (ackLock) {
-            if (activeAck != null || ackQueue.isEmpty()) {
-                return;
-            }
-            currentGatt = gatt;
-            currentRx = rxCharacteristic;
-            if (currentGatt == null || currentRx == null) {
-                Log.w(TAG, "Drop queued ACK: GATT channel is unavailable");
-                ackQueue.clear();
-                return;
-            }
-            next = ackQueue.removeFirst();
-            activeAck = next;
-        }
-        currentRx.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-        currentRx.setValue(next.value);
-        if (!currentGatt.writeCharacteristic(currentRx)) {
-            synchronized (ackLock) {
-                activeAck = null;
-            }
-            Log.e(TAG, "ACK write rejected by GATT: phase=" + next.phase + " offset=" + next.offset);
-            setStatus("ACK 写入未进入 GATT 队列；phase=" + next.phase + " offset=" + next.offset);
-        } else {
-            Log.i(TAG, "ACK write started: phase=" + next.phase + " offset=" + next.offset);
-        }
-    }
-
-    private void onAckWriteComplete(int status) {
-        Ack completed;
-        synchronized (ackLock) {
-            completed = activeAck;
-            activeAck = null;
-        }
-        if (completed == null) {
-            Log.w(TAG, "Unexpected ACK write callback: status=" + status);
+        BluetoothGatt currentGatt = gatt;
+        BluetoothGattCharacteristic currentRx = rxCharacteristic;
+        if (currentGatt == null || currentRx == null) {
+            Log.w(TAG, "Drop ACK: GATT channel is unavailable");
             return;
         }
-        if (status == BluetoothGatt.GATT_SUCCESS) {
-            Log.i(TAG, "ACK write complete: phase=" + completed.phase + " offset=" + completed.offset);
-            writeNextAck();
+        // The earphone RX characteristic supports GATT_WR_CMD.  Do not wait for
+        // onCharacteristicWrite(): some Android stacks deliver the command but omit that callback.
+        currentRx.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+        currentRx.setValue(ack);
+        if (!currentGatt.writeCharacteristic(currentRx)) {
+            Log.e(TAG, "ACK command rejected by GATT: phase=" + phase + " offset=" + nextOffset);
+            setStatus("ACK 命令未进入 GATT 队列；phase=" + phase + " offset=" + nextOffset);
         } else {
-            Log.e(TAG, "ACK write failed: phase=" + completed.phase + " offset=" + completed.offset
-                    + " status=" + status);
-            setStatus("ACK 写入失败，status=" + status + " phase=" + completed.phase);
-        }
-    }
-
-    private void clearAckQueue() {
-        synchronized (ackLock) {
-            ackQueue.clear();
-            activeAck = null;
+            Log.i(TAG, "ACK command queued: phase=" + phase + " status=" + status + " offset=" + nextOffset);
         }
     }
 
@@ -566,25 +505,12 @@ public final class MainActivity extends Activity {
 
     @SuppressLint("MissingPermission")
     private void closeGatt() {
-        clearAckQueue();
         if (gatt != null) {
             gatt.disconnect();
             gatt.close();
             gatt = null;
         }
         rxCharacteristic = null;
-    }
-
-    private static final class Ack {
-        final int phase;
-        final int offset;
-        final byte[] value;
-
-        Ack(int phase, int offset, byte[] value) {
-            this.phase = phase;
-            this.offset = offset;
-            this.value = value;
-        }
     }
 
     @Override
