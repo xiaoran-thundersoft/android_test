@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.view.Gravity;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -26,6 +27,7 @@ import android.widget.ListView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -37,6 +39,7 @@ import java.util.zip.CRC32;
  * The protocol is defined in the firmware file camera_ble_test_protocol.md.
  */
 public final class MainActivity extends Activity {
+    private static final String TAG = "CameraBleTest";
     private static final int REQUEST_PERMISSIONS = 100;
     private static final long SCAN_DURATION_MS = 10_000;
     private static final int MAX_IMAGE_SIZE = 512 * 1024;
@@ -58,6 +61,8 @@ public final class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, BluetoothDevice> devices = new LinkedHashMap<>();
     private final ArrayList<String> deviceRows = new ArrayList<>();
+    private final Object ackLock = new Object();
+    private final ArrayDeque<Ack> ackQueue = new ArrayDeque<>();
 
     private BluetoothAdapter adapter;
     private BluetoothLeScanner scanner;
@@ -77,6 +82,8 @@ public final class MainActivity extends Activity {
     private int sessionId;
     private long expectedCrc;
     private long startNs;
+    private Ack activeAck;
+    private int notificationCount;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -227,21 +234,38 @@ public final class MainActivity extends Activity {
         gatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
     }
 
+    private boolean isCurrentGatt(BluetoothGatt currentGatt) {
+        return currentGatt != null && currentGatt == gatt;
+    }
+
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
         @Override
         @SuppressLint("MissingPermission")
         public void onConnectionStateChange(BluetoothGatt currentGatt, int status, int newState) {
+            if (!isCurrentGatt(currentGatt)) {
+                Log.i(TAG, "Ignore stale connection callback: status=" + status + " state=" + newState);
+                return;
+            }
             runOnUiThread(() -> {
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    setStatus("连接失败，GATT status=" + status);
+                Log.i(TAG, "Connection state: status=" + status + " state=" + newState);
+                if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+                    clearAckQueue();
+                    rxCharacteristic = null;
+                    if (gatt == currentGatt) {
+                        gatt = null;
+                    }
+                    setStatus("BLE 已断开，GATT status=" + status);
                     return;
                 }
                 if (newState == BluetoothGatt.STATE_CONNECTED) {
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        setStatus("连接建立失败，GATT status=" + status);
+                        return;
+                    }
                     setStatus("已连接，正在发现服务…");
                     currentGatt.discoverServices();
-                } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
-                    setStatus("BLE 已断开。");
-                    rxCharacteristic = null;
+                } else if (status != BluetoothGatt.GATT_SUCCESS) {
+                    setStatus("GATT 状态异常，status=" + status + " state=" + newState);
                 }
             });
         }
@@ -249,6 +273,9 @@ public final class MainActivity extends Activity {
         @Override
         @SuppressLint("MissingPermission")
         public void onServicesDiscovered(BluetoothGatt currentGatt, int status) {
+            if (!isCurrentGatt(currentGatt)) {
+                return;
+            }
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 setStatus("服务发现失败，status=" + status);
                 return;
@@ -285,6 +312,9 @@ public final class MainActivity extends Activity {
 
         @Override
         public void onDescriptorWrite(BluetoothGatt currentGatt, BluetoothGattDescriptor descriptor, int status) {
+            if (!isCurrentGatt(currentGatt)) {
+                return;
+            }
             if (CCCD_UUID.equals(descriptor.getUuid()) && status == BluetoothGatt.GATT_SUCCESS) {
                 setStatus("测试通道已就绪。现在在耳机 eShell 执行：camera_ble_test");
             } else if (CCCD_UUID.equals(descriptor.getUuid())) {
@@ -294,6 +324,9 @@ public final class MainActivity extends Activity {
 
         @Override
         public void onMtuChanged(BluetoothGatt currentGatt, int mtu, int status) {
+            if (!isCurrentGatt(currentGatt)) {
+                return;
+            }
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 setStatus("协商 MTU=" + mtu + "，正在订阅图片通道…");
             } else {
@@ -309,13 +342,27 @@ public final class MainActivity extends Activity {
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt currentGatt, BluetoothGattCharacteristic characteristic) {
-            handleNotification(characteristic.getValue());
+            if (isCurrentGatt(currentGatt) && TX_UUID.equals(characteristic.getUuid())) {
+                byte[] value = characteristic.getValue();
+                handleNotification(value == null ? null : value.clone());
+            }
         }
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt currentGatt, BluetoothGattCharacteristic characteristic,
                                             byte[] value) {
-            handleNotification(value);
+            if (isCurrentGatt(currentGatt) && TX_UUID.equals(characteristic.getUuid())) {
+                handleNotification(value);
+            }
+        }
+
+        @Override
+        public void onCharacteristicWrite(BluetoothGatt currentGatt,
+                                          BluetoothGattCharacteristic characteristic, int status) {
+            if (!isCurrentGatt(currentGatt) || !RX_UUID.equals(characteristic.getUuid())) {
+                return;
+            }
+            onAckWriteComplete(status);
         }
     };
 
@@ -325,6 +372,9 @@ public final class MainActivity extends Activity {
         }
         int type = frame[3] & 0xFF;
         int incomingSession = le16(frame, 4);
+        notificationCount++;
+        Log.i(TAG, "RX frame #" + notificationCount + " type=" + type + " session=" + incomingSession
+                + " bytes=" + frame.length);
         if (type == TYPE_START) {
             handleStart(frame, incomingSession);
         } else if (type == TYPE_DATA) {
@@ -355,6 +405,7 @@ public final class MainActivity extends Activity {
             prnPackets = 1;
         }
         startNs = System.nanoTime();
+        notificationCount = 1;
         sendAck(sessionId, ACK_START, 0, 0, 0);
         setStatus("开始接收：" + imageSize + " B，session=" + sessionId + "，PRN=" + prnPackets);
     }
@@ -374,6 +425,7 @@ public final class MainActivity extends Activity {
         received += payloadLen;
         packetsSinceAck++;
         if (packetsSinceAck >= prnPackets || received == imageSize) {
+            Log.i(TAG, "Queue DATA ACK: offset=" + received + " packets=" + packetsSinceAck);
             sendAck(sessionId, ACK_DATA, 0, received, 0);
             packetsSinceAck = 0;
         }
@@ -408,9 +460,6 @@ public final class MainActivity extends Activity {
 
     @SuppressLint("MissingPermission")
     private void sendAck(int session, int phase, int status, int nextOffset, long crc) {
-        if (gatt == null || rxCharacteristic == null) {
-            return;
-        }
         byte[] ack = new byte[16];
         putLe16(ack, 0, MAGIC);
         ack[2] = VERSION;
@@ -420,10 +469,69 @@ public final class MainActivity extends Activity {
         ack[7] = (byte) status;
         putLe32(ack, 8, nextOffset);
         putLe32(ack, 12, crc);
-        rxCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-        rxCharacteristic.setValue(ack);
-        if (!gatt.writeCharacteristic(rxCharacteristic)) {
-            setStatus("ACK 写入未进入 GATT 队列。");
+        synchronized (ackLock) {
+            ackQueue.addLast(new Ack(phase, nextOffset, ack));
+        }
+        Log.i(TAG, "Queue ACK: phase=" + phase + " status=" + status + " offset=" + nextOffset);
+        writeNextAck();
+    }
+
+    @SuppressLint("MissingPermission")
+    private void writeNextAck() {
+        Ack next;
+        BluetoothGatt currentGatt;
+        BluetoothGattCharacteristic currentRx;
+        synchronized (ackLock) {
+            if (activeAck != null || ackQueue.isEmpty()) {
+                return;
+            }
+            currentGatt = gatt;
+            currentRx = rxCharacteristic;
+            if (currentGatt == null || currentRx == null) {
+                Log.w(TAG, "Drop queued ACK: GATT channel is unavailable");
+                ackQueue.clear();
+                return;
+            }
+            next = ackQueue.removeFirst();
+            activeAck = next;
+        }
+        currentRx.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        currentRx.setValue(next.value);
+        if (!currentGatt.writeCharacteristic(currentRx)) {
+            synchronized (ackLock) {
+                activeAck = null;
+            }
+            Log.e(TAG, "ACK write rejected by GATT: phase=" + next.phase + " offset=" + next.offset);
+            setStatus("ACK 写入未进入 GATT 队列；phase=" + next.phase + " offset=" + next.offset);
+        } else {
+            Log.i(TAG, "ACK write started: phase=" + next.phase + " offset=" + next.offset);
+        }
+    }
+
+    private void onAckWriteComplete(int status) {
+        Ack completed;
+        synchronized (ackLock) {
+            completed = activeAck;
+            activeAck = null;
+        }
+        if (completed == null) {
+            Log.w(TAG, "Unexpected ACK write callback: status=" + status);
+            return;
+        }
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            Log.i(TAG, "ACK write complete: phase=" + completed.phase + " offset=" + completed.offset);
+            writeNextAck();
+        } else {
+            Log.e(TAG, "ACK write failed: phase=" + completed.phase + " offset=" + completed.offset
+                    + " status=" + status);
+            setStatus("ACK 写入失败，status=" + status + " phase=" + completed.phase);
+        }
+    }
+
+    private void clearAckQueue() {
+        synchronized (ackLock) {
+            ackQueue.clear();
+            activeAck = null;
         }
     }
 
@@ -458,12 +566,25 @@ public final class MainActivity extends Activity {
 
     @SuppressLint("MissingPermission")
     private void closeGatt() {
+        clearAckQueue();
         if (gatt != null) {
             gatt.disconnect();
             gatt.close();
             gatt = null;
         }
         rxCharacteristic = null;
+    }
+
+    private static final class Ack {
+        final int phase;
+        final int offset;
+        final byte[] value;
+
+        Ack(int phase, int offset, byte[] value) {
+            this.phase = phase;
+            this.offset = offset;
+            this.value = value;
+        }
     }
 
     @Override
