@@ -337,24 +337,49 @@ public final class MainActivity extends Activity {
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt currentGatt, BluetoothGattCharacteristic characteristic) {
-            if (isCurrentGatt(currentGatt) && TX_UUID.equals(characteristic.getUuid())) {
-                byte[] value = characteristic.getValue();
-                handleNotification(value == null ? null : value.clone());
-            }
+            byte[] value = characteristic.getValue();
+            onNotification(currentGatt, characteristic, value == null ? null : value.clone(), "legacy");
         }
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt currentGatt, BluetoothGattCharacteristic characteristic,
                                             byte[] value) {
-            if (isCurrentGatt(currentGatt) && TX_UUID.equals(characteristic.getUuid())) {
-                handleNotification(value);
-            }
+            onNotification(currentGatt, characteristic, value, "api33");
         }
 
     };
 
+    private void onNotification(BluetoothGatt currentGatt, BluetoothGattCharacteristic characteristic, byte[] value,
+                                String callback) {
+        if (!isCurrentGatt(currentGatt)) {
+            Log.w(TAG, "Ignore stale notification: callback=" + callback);
+            return;
+        }
+        String uuid = characteristic == null ? "null" : characteristic.getUuid().toString();
+        Log.i(TAG, "Notification: callback=" + callback + " uuid=" + uuid + " bytes="
+                + (value == null ? -1 : value.length) + " head=" + hexPrefix(value, 12));
+        if (characteristic == null || !TX_UUID.equals(characteristic.getUuid())) {
+            Log.w(TAG, "Reject notification: unexpected characteristic=" + uuid);
+            return;
+        }
+        handleNotification(value);
+    }
+
     private void handleNotification(byte[] frame) {
-        if (frame == null || frame.length < 6 || le16(frame, 0) != MAGIC || frame[2] != VERSION) {
+        if (frame == null) {
+            Log.w(TAG, "Reject frame: null");
+            return;
+        }
+        if (frame.length < 6) {
+            Log.w(TAG, "Reject frame: too short, bytes=" + frame.length);
+            return;
+        }
+        if (le16(frame, 0) != MAGIC) {
+            Log.w(TAG, "Reject frame: magic=0x" + Integer.toHexString(le16(frame, 0)));
+            return;
+        }
+        if (frame[2] != VERSION) {
+            Log.w(TAG, "Reject frame: version=" + (frame[2] & 0xFF));
             return;
         }
         int type = frame[3] & 0xFF;
@@ -373,6 +398,7 @@ public final class MainActivity extends Activity {
 
     private void handleStart(byte[] frame, int incomingSession) {
         if (frame.length != 17) {
+            Log.w(TAG, "Reject START: bytes=" + frame.length + " expected=17");
             return;
         }
         int size = le32(frame, 6);
@@ -398,7 +424,16 @@ public final class MainActivity extends Activity {
     }
 
     private void handleData(byte[] frame, int incomingSession) {
-        if (image == null || incomingSession != sessionId || frame.length < 12) {
+        if (image == null) {
+            Log.w(TAG, "Reject DATA: no active image, session=" + incomingSession);
+            return;
+        }
+        if (incomingSession != sessionId) {
+            Log.w(TAG, "Reject DATA: session=" + incomingSession + " expected=" + sessionId);
+            return;
+        }
+        if (frame.length < 12) {
+            Log.w(TAG, "Reject DATA: bytes=" + frame.length + " expected>=12");
             return;
         }
         int offset = le32(frame, 6);
@@ -424,7 +459,16 @@ public final class MainActivity extends Activity {
     }
 
     private void handleEnd(byte[] frame, int incomingSession) {
-        if (image == null || incomingSession != sessionId || frame.length != 14) {
+        if (image == null) {
+            Log.w(TAG, "Reject END: no active image, session=" + incomingSession);
+            return;
+        }
+        if (incomingSession != sessionId) {
+            Log.w(TAG, "Reject END: session=" + incomingSession + " expected=" + sessionId);
+            return;
+        }
+        if (frame.length != 14) {
+            Log.w(TAG, "Reject END: bytes=" + frame.length + " expected=14");
             return;
         }
         int declaredSize = le32(frame, 6);
@@ -489,6 +533,24 @@ public final class MainActivity extends Activity {
 
     private static long le32Unsigned(byte[] value, int offset) {
         return le32(value, offset) & 0xFFFFFFFFL;
+    }
+
+    private static String hexPrefix(byte[] value, int maxBytes) {
+        if (value == null) {
+            return "null";
+        }
+        StringBuilder result = new StringBuilder();
+        int count = Math.min(value.length, maxBytes);
+        for (int i = 0; i < count; i++) {
+            if (i != 0) {
+                result.append(' ');
+            }
+            result.append(String.format(Locale.US, "%02X", value[i] & 0xFF));
+        }
+        if (value.length > count) {
+            result.append(" …");
+        }
+        return result.toString();
     }
 
     private static void putLe16(byte[] value, int offset, int number) {
