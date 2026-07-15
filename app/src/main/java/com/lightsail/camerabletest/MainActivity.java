@@ -14,14 +14,18 @@ import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.TextView;
@@ -68,6 +72,7 @@ public final class MainActivity extends Activity {
     private ArrayAdapter<String> deviceAdapter;
     private TextView statusView;
     private TextView resultView;
+    private ImageView previewView;
     private Button scanButton;
     private boolean scanning;
 
@@ -112,12 +117,19 @@ public final class MainActivity extends Activity {
         list.setAdapter(deviceAdapter);
         list.setOnItemClickListener((parent, view, position, id) -> connect(position));
         root.addView(list, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(160)));
 
         statusView = textView();
         root.addView(statusView);
         resultView = textView();
         root.addView(resultView);
+
+        previewView = new ImageView(this);
+        previewView.setAdjustViewBounds(true);
+        previewView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        previewView.setVisibility(View.GONE);
+        root.addView(previewView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(260)));
 
         setContentView(root);
         setStatus("点击“扫描耳机”，选择设备后等待“测试通道已就绪”。");
@@ -129,6 +141,10 @@ public final class MainActivity extends Activity {
         view.setTextSize(15);
         view.setGravity(Gravity.START);
         return view;
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     private boolean hasPermissions() {
@@ -484,7 +500,19 @@ public final class MainActivity extends Activity {
         String message = String.format(Locale.US,
                 "%s：图片=%d B，APP 接收=%d ms，APP 接收速率=%d B/s，CRC=%08X",
                 valid ? "完成" : "失败", received, elapsedMs, rate, actualCrc);
-        runOnUiThread(() -> resultView.setText(message));
+        Bitmap preview = valid ? BitmapFactory.decodeByteArray(image, 0, received) : null;
+        if (valid && preview == null) {
+            message += "；JPEG 解码失败";
+        }
+        final String completedMessage = message;
+        final Bitmap completedPreview = preview;
+        runOnUiThread(() -> {
+            resultView.setText(completedMessage);
+            if (completedPreview != null) {
+                previewView.setImageBitmap(completedPreview);
+                previewView.setVisibility(View.VISIBLE);
+            }
+        });
         setStatus(valid ? "已回 END ACK；查看耳机 [CAM_BLE_TEST] 日志取得端到端结果。" : "CRC/长度校验失败，已回错误 ACK。");
         image = null;
     }
