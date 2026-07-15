@@ -85,6 +85,8 @@ public final class MainActivity extends Activity {
     private long expectedCrc;
     private long startNs;
     private int notificationCount;
+    private int currentTxPhy;
+    private int currentRxPhy;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -262,6 +264,8 @@ public final class MainActivity extends Activity {
                 Log.i(TAG, "Connection state: status=" + status + " state=" + newState);
                 if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                     rxCharacteristic = null;
+                    currentTxPhy = 0;
+                    currentRxPhy = 0;
                     if (gatt == currentGatt) {
                         gatt = null;
                     }
@@ -273,7 +277,17 @@ public final class MainActivity extends Activity {
                         setStatus("连接建立失败，GATT status=" + status);
                         return;
                     }
-                    setStatus("已连接，正在发现服务…");
+                    boolean priorityRequested = currentGatt.requestConnectionPriority(
+                            BluetoothGatt.CONNECTION_PRIORITY_HIGH);
+                    Log.i(TAG, "Connection priority HIGH requested=" + priorityRequested);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        currentGatt.setPreferredPhy(BluetoothDevice.PHY_LE_2M_MASK,
+                                BluetoothDevice.PHY_LE_2M_MASK, BluetoothDevice.PHY_OPTION_NO_PREFERRED);
+                        Log.i(TAG, "Preferred PHY requested: tx=2M rx=2M");
+                    } else {
+                        Log.i(TAG, "Preferred PHY request unavailable below Android 8.0");
+                    }
+                    setStatus("已连接，已请求高优先级和2M PHY，正在发现服务…");
                     currentGatt.discoverServices();
                 } else if (status != BluetoothGatt.GATT_SUCCESS) {
                     setStatus("GATT 状态异常，status=" + status + " state=" + newState);
@@ -327,7 +341,8 @@ public final class MainActivity extends Activity {
                 return;
             }
             if (CCCD_UUID.equals(descriptor.getUuid()) && status == BluetoothGatt.GATT_SUCCESS) {
-                setStatus("测试通道已就绪。现在在耳机 eShell 执行：camera_ble_test");
+                setStatus("测试通道已就绪，PHY=" + phyName(currentTxPhy) + "/" + phyName(currentRxPhy)
+                        + "。现在在耳机 eShell 执行：ble_camera_test 0 85 1");
             } else if (CCCD_UUID.equals(descriptor.getUuid())) {
                 setStatus("订阅失败，status=" + status);
             }
@@ -349,6 +364,19 @@ public final class MainActivity extends Activity {
                     subscribeToImageNotifications(currentGatt, tx);
                 }
             }
+        }
+
+        @Override
+        public void onPhyUpdate(BluetoothGatt currentGatt, int txPhy, int rxPhy, int status) {
+            if (!isCurrentGatt(currentGatt)) {
+                return;
+            }
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                currentTxPhy = txPhy;
+                currentRxPhy = rxPhy;
+            }
+            Log.i(TAG, "PHY update: status=" + status + " tx=" + phyName(txPhy) + " rx=" + phyName(rxPhy));
+            setStatus("PHY更新：status=" + status + "，tx=" + phyName(txPhy) + "，rx=" + phyName(rxPhy));
         }
 
         @Override
@@ -435,8 +463,10 @@ public final class MainActivity extends Activity {
         }
         startNs = System.nanoTime();
         notificationCount = 1;
+        Log.i(TAG, "START link: txPhy=" + phyName(currentTxPhy) + " rxPhy=" + phyName(currentRxPhy));
         sendAck(sessionId, ACK_START, 0, 0, 0);
-        setStatus("开始接收：" + imageSize + " B，session=" + sessionId + "，PRN=" + prnPackets);
+        setStatus("开始接收：" + imageSize + " B，session=" + sessionId + "，PRN=" + prnPackets
+                + "，PHY=" + phyName(currentTxPhy) + "/" + phyName(currentRxPhy));
     }
 
     private void handleData(byte[] frame, int incomingSession) {
@@ -579,6 +609,19 @@ public final class MainActivity extends Activity {
             result.append(" …");
         }
         return result.toString();
+    }
+
+    private static String phyName(int phy) {
+        if (phy == BluetoothDevice.PHY_LE_1M) {
+            return "1M";
+        }
+        if (phy == BluetoothDevice.PHY_LE_2M) {
+            return "2M";
+        }
+        if (phy == BluetoothDevice.PHY_LE_CODED) {
+            return "CODED";
+        }
+        return "UNKNOWN(" + phy + ")";
     }
 
     private static void putLe16(byte[] value, int offset, int number) {
